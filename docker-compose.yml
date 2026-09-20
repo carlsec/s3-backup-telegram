@@ -1,0 +1,27 @@
+# SAFETY: every path on the left of a ":" below is a bind mount — a real
+# folder on this host, next to this docker-compose.yml — never a Docker
+# named volume. A named volume is owned and can be silently destroyed by
+# Docker itself (`docker volume rm`, `docker compose down -v`,
+# `docker system prune --volumes`). A bind mount is just a folder on disk:
+# removing the container, the image, or the whole compose stack NEVER
+# touches it.
+#
+# These are relative paths (./backups/...), so Docker Compose resolves them
+# relative to THIS file's directory and creates them automatically on first
+# run. If you move this project to another machine/drive, the data moves
+# with it (it's just a folder in ./backups). See README.md "Data safety".
+services:
+  s3-backup:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./backups/lei-institute-prod-institute-storage:/backup/lei-institute-prod-institute-storage
+      - ./backups/lei-prod-storage:/backup/lei-prod-storage
+      - ./backups/pub-lei-institute-prod-institute-storage:/backup/pub-lei-institute-prod-institute-storage
+      - ./backups/pub-lei-prod-storage:/backup/pub-lei-prod-storage
+      - ./backups/sicon-backups:/backup/sicon-backups
+      - ./logs:/var/log/s3-backup
+    restart: unless-stopped

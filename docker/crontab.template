@@ -1,0 +1,1 @@
+__BACKUP_SCHEDULE_CRON__ cd /app && python3 -m src.s3_backup.main
