@@ -19,6 +19,8 @@ consolidated Telegram message per run.
   `--delete` is ever added back.
 - Each run reports, per bucket: how many new objects/bytes were pulled **this run**, and the total
   size currently on disk for that bucket (see [Telegram message](#telegram-message-format) below).
+  The "total on disk" figure is tracked incrementally (last known total + what this run added), not
+  re-measured with a full directory scan every time — see [Data safety](#data-safety) for why.
 - Inside Docker, [`supercronic`](https://github.com/aptible/supercronic) runs the job on a daily
   schedule, logging to stdout and forwarding signals correctly (unlike classic cron).
 
@@ -36,7 +38,6 @@ Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
 | `BACKUP_SCHEDULE_CRON` | no (default `0 3 * * *`) | Cron expression, evaluated in container time (UTC unless `TZ` is set) |
 | `BACKUP_LOG_FILE` | no (default `/var/log/s3-backup/backup.log`) | Structured log file path (stdout is always used too) |
 | `BACKUP_BUCKET_<N>_NAME` / `BACKUP_BUCKET_<N>_DEST` | at least one pair | Bucket name and local destination path, `N = 1, 2, 3, ...` — add or remove pairs to change what gets backed up, no code change needed |
-| `BACKUP_SHRINK_GUARD_RATIO` | no (default `0.5`) | Safety threshold — see [Data safety](#data-safety) below |
 | `BACKUP_SYNC_TIMEOUT_HOURS` | no (default `6`) | Kills a single bucket's sync (and reports it as a failure) if it hasn't finished within this many hours — protects against `s5cmd` hanging indefinitely (e.g. a stalled credential lookup) and blocking every other bucket |
 
 ## Telegram message format
@@ -86,20 +87,28 @@ data loss or a corrupted backup**:
    them as plain folder paths, never `docker volume`.
 2. **Never `--delete`.** The sync is pull-only: objects removed from S3 are never removed locally.
    This is asserted in code and covered by a test (`test_sync_bucket_never_passes_delete_flag`).
-3. **Shrink guard.** Before every sync, the script compares the destination's current size on disk
-   against the size it recorded after the *last successful* sync for that bucket (kept in a small
-   `.s3_backup_state.json` file inside each destination folder). If the current size is less than
-   `BACKUP_SHRINK_GUARD_RATIO` (default 50%) of the last known size, the sync for that bucket is
+3. **Shrink guard.** Before every sync, the script checks whether the destination folder is
+   completely empty *when it shouldn't be* — i.e. a `.s3_backup_state.json` file (written after
+   every successful sync, recording the last known total size) says this bucket previously had
+   real data, but the folder now has nothing in it. When that happens, the sync for that bucket is
    **refused** and reported as a failure in the Telegram summary — instead of silently starting a
-   fresh, near-empty "backup" into what is almost certainly an unmounted or misconfigured volume.
+   fresh, empty "backup" into what is almost certainly an unmounted or misconfigured volume.
+   This check is intentionally O(1)-ish (stops at the first file it finds, never scans the whole
+   tree) rather than a full recursive size comparison: for a bucket with hundreds of thousands of
+   objects, a full `os.walk` over the destination took 20+ minutes **on every single run** in
+   practice — an earlier version of this guard did that, and it was the main reason daily runs
+   were taking hours before even starting the actual sync. The "total on disk" figure reported to
+   Telegram is now tracked incrementally (last known total + what this run transferred) for the
+   same reason — it's an estimate that can drift from the literal on-disk truth over a very long
+   time (e.g. if files are manually deleted outside this tool), not a value re-verified by walking
+   every file every day.
 4. **Operational checklist before starting/restarting the container**:
    - Confirm the NAS/host paths in `docker-compose.yml` are actually mounted on the host
      (`mount | grep nas`, or however your NAS client reports it) before `docker compose up`.
    - Never point two different buckets' `_DEST` at the same host path — that would let one
-     bucket's `total_local_bytes` reflect another bucket's data and can trip the shrink guard
-     unpredictably.
+     bucket's state file get confused with another bucket's data.
    - If you deliberately need to reset the guard's baseline (e.g. real storage migration), delete
-     that bucket's `.s3_backup_state.json` file — don't just lower `BACKUP_SHRINK_GUARD_RATIO`.
+     that bucket's `.s3_backup_state.json` file.
 
 ### Adding/removing buckets
 
