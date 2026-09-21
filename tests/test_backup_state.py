@@ -27,17 +27,45 @@ def test_write_then_read_state_roundtrip(tmp_path):
     assert backup_state.read_previous_total_bytes(str(tmp_path)) == 12345
 
 
-def test_looks_suspiciously_smaller_true_on_big_drop():
-    assert backup_state.looks_suspiciously_smaller(100, 1000, ratio=0.5) is True
+def test_dir_has_entries_false_on_empty_dir(tmp_path):
+    assert backup_state.dir_has_entries(str(tmp_path)) is False
 
 
-def test_looks_suspiciously_smaller_false_on_small_drop():
-    assert backup_state.looks_suspiciously_smaller(900, 1000, ratio=0.5) is False
+def test_dir_has_entries_false_when_only_state_file_present(tmp_path):
+    backup_state.write_state(str(tmp_path), 100)
+
+    assert backup_state.dir_has_entries(str(tmp_path)) is False
 
 
-def test_looks_suspiciously_smaller_false_when_growing():
-    assert backup_state.looks_suspiciously_smaller(2000, 1000, ratio=0.5) is False
+def test_dir_has_entries_true_with_a_real_file(tmp_path):
+    (tmp_path / "a.txt").write_bytes(b"x")
+
+    assert backup_state.dir_has_entries(str(tmp_path)) is True
 
 
-def test_looks_suspiciously_smaller_false_when_no_previous_history():
-    assert backup_state.looks_suspiciously_smaller(0, 0, ratio=0.5) is False
+def test_dir_has_entries_true_with_only_a_subdirectory(tmp_path):
+    (tmp_path / "sub").mkdir()
+
+    assert backup_state.dir_has_entries(str(tmp_path)) is True
+
+
+def test_dir_has_entries_false_for_nonexistent_path(tmp_path):
+    assert backup_state.dir_has_entries(str(tmp_path / "does-not-exist")) is False
+
+
+def test_dir_has_entries_stops_at_first_match(tmp_path, monkeypatch):
+    """Must not need to enumerate every entry — one hit is enough to return."""
+    (tmp_path / "a.txt").write_bytes(b"x")
+    (tmp_path / "b.txt").write_bytes(b"y")
+
+    real_scandir = backup_state.os.scandir
+    calls = []
+
+    def counting_scandir(path):
+        calls.append(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(backup_state.os, "scandir", counting_scandir)
+
+    assert backup_state.dir_has_entries(str(tmp_path)) is True
+    assert len(calls) == 1

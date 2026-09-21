@@ -178,9 +178,9 @@ def test_sync_bucket_counts_new_objects_and_bytes(tmp_path):
 
 def test_sync_bucket_shrink_guard_skips_sync_when_destination_looks_wiped(tmp_path):
     """
-    If a previous run recorded e.g. 1GB on disk and the destination now looks
-    almost empty, the sync must be refused instead of quietly "backing up"
-    into what is probably an unmounted/wrong volume.
+    If a previous run recorded e.g. 1GB on disk and the destination is now
+    completely empty, the sync must be refused instead of quietly "backing
+    up" into what is probably an unmounted/wrong volume.
     """
     from src.s3_backup import backup_state
 
@@ -196,7 +196,9 @@ def test_sync_bucket_shrink_guard_skips_sync_when_destination_looks_wiped(tmp_pa
 
 
 def test_sync_bucket_shrink_guard_allows_normal_growth(tmp_path):
-    """A destination that's still close to its previous size syncs normally."""
+    """A destination that still has files in it syncs normally, even if its
+    on-disk size doesn't exactly match the recorded total (no full re-walk
+    is done to verify that anymore — only emptiness is checked)."""
     from src.s3_backup import backup_state
 
     existing = tmp_path / "existing.txt"

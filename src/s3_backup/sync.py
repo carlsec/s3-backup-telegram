@@ -9,9 +9,6 @@ from src.s3_backup.config import BucketTarget
 from src.s3_backup.summary import BucketResult
 from src.s3_backup.logging_setup import get_logger
 
-SHRINK_GUARD_RATIO = float(
-    os.getenv("BACKUP_SHRINK_GUARD_RATIO", str(backup_state.DEFAULT_SHRINK_GUARD_RATIO))
-)
 SYNC_TIMEOUT_SECONDS = float(os.getenv("BACKUP_SYNC_TIMEOUT_HOURS", "6")) * 3600
 
 _CP_LINE_RE = re.compile(r"^cp (\S+) (.+)$")
@@ -35,15 +32,20 @@ def sync_bucket(target: BucketTarget) -> BucketResult:
 
     os.makedirs(target.dest_path, exist_ok=True)
 
-    size_before = backup_state.compute_dir_size_bytes(target.dest_path)
+    # Cheap check (stops at the first entry found, never scans the whole
+    # tree): if we previously recorded real data here but the directory now
+    # looks completely empty, that's the signature of an unmounted/wrong
+    # volume — refuse to sync rather than silently "backing up" into it.
     previous_total = backup_state.read_previous_total_bytes(target.dest_path)
 
-    if previous_total is not None and backup_state.looks_suspiciously_smaller(
-        size_before, previous_total, SHRINK_GUARD_RATIO
+    if (
+        previous_total is not None
+        and previous_total > 0
+        and not backup_state.dir_has_entries(target.dest_path)
     ):
         error_msg = (
-            f"destination has {size_before} bytes but the last successful run "
-            f"recorded {previous_total} bytes — "
+            f"destination looks completely empty but the last successful run "
+            f"recorded {previous_total} bytes there — "
             f"this usually means the volume/NAS mount is missing or wrong. "
             f"Sync SKIPPED to avoid backing up onto a lost mount."
         )
@@ -144,7 +146,10 @@ def sync_bucket(target: BucketTarget) -> BucketResult:
                 error=error_msg,
             )
 
-        total_local_bytes = backup_state.compute_dir_size_bytes(target.dest_path)
+        # Incremental, not a full re-walk: previous known total + what this
+        # run actually transferred. A full os.walk over hundreds of
+        # thousands of files took 20+ minutes in practice — this is instant.
+        total_local_bytes = (previous_total or 0) + bytes_transferred
         backup_state.write_state(target.dest_path, total_local_bytes)
 
         logger.info(
