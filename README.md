@@ -5,11 +5,14 @@ consolidated Telegram message per run.
 
 ## How it works
 
-- `src/s3_backup/main.py` orchestrates a run: read bucket config from env → `aws s3 sync` each
+- `src/s3_backup/main.py` orchestrates a run: read bucket config from env → `s5cmd sync` each
   bucket (subprocess) → isolate per-bucket failures → send one Telegram summary → exit non-zero
   if any bucket failed.
-- Incremental transfer comes from `aws s3 sync` itself (only new/changed objects are copied on
+- Incremental transfer comes from `s5cmd sync` itself (only new/changed objects are copied on
   each run) — this project does not reimplement S3 diffing.
+- Sync output is streamed line by line into the logs as it happens (not buffered until the whole
+  command finishes), so a large bucket's progress is visible in `docker compose logs -f` in real
+  time instead of going silent for the entire run.
 - **Pull-only, never destructive**: the sync command never passes `--delete` — if an object is
   removed from S3, the local copy is kept, never deleted. This is enforced in code
   (`src/s3_backup/sync.py`), asserted at runtime, and covered by a test that fails the suite if
@@ -34,6 +37,7 @@ Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`.**
 | `BACKUP_LOG_FILE` | no (default `/var/log/s3-backup/backup.log`) | Structured log file path (stdout is always used too) |
 | `BACKUP_BUCKET_<N>_NAME` / `BACKUP_BUCKET_<N>_DEST` | at least one pair | Bucket name and local destination path, `N = 1, 2, 3, ...` — add or remove pairs to change what gets backed up, no code change needed |
 | `BACKUP_SHRINK_GUARD_RATIO` | no (default `0.5`) | Safety threshold — see [Data safety](#data-safety) below |
+| `BACKUP_SYNC_TIMEOUT_HOURS` | no (default `6`) | Kills a single bucket's sync (and reports it as a failure) if it hasn't finished within this many hours — protects against `s5cmd` hanging indefinitely (e.g. a stalled credential lookup) and blocking every other bucket |
 
 ## Telegram message format
 
@@ -53,6 +57,19 @@ OK: 4 | Failed: 1
 "new object(s)" and their size are what changed **in this run only**; "total on disk" is the
 cumulative size of everything backed up so far for that bucket, computed after each successful
 sync.
+
+## Why s5cmd
+
+This project uses [`s5cmd`](https://github.com/peak/s5cmd) instead of `aws s3 sync`. For buckets
+with a large **number** of objects (hundreds of thousands+), the Python/GIL-bound `aws-cli` is
+documented to be an order of magnitude slower than s5cmd's parallel Go implementation — one
+reported case saw `aws s3 sync` throughput drop to ~1 MiB/s on a large-object-count bucket despite
+a much faster network link being available ([aws-cli#6682](https://github.com/aws/aws-cli/issues/6682)).
+Independent benchmarks report `s5cmd` at 12-26x faster than `aws-cli` for this exact workload shape
+([s5cmd benchmark writeup](https://joshua-robinson.medium.com/s5cmd-for-high-performance-object-storage-7071352cc09d)).
+`s5cmd sync` has the same pull-only, incremental-by-default semantics as `aws s3 sync` (compares
+size + modification time, never deletes unless `--delete` is passed — which this project never
+does), so behavior is equivalent, just faster.
 
 ## Data safety
 
@@ -127,7 +144,8 @@ To stop cleanly: `docker compose down` (supercronic runs as PID 1 and shuts down
 python3 -m pytest tests/ -v
 ```
 
-All AWS/Telegram calls are mocked — no live credentials or network access needed to run the suite.
+All AWS/Telegram calls are mocked (`s5cmd`/Telegram subprocess and HTTP calls are patched) — no
+live credentials or network access needed to run the suite.
 
 ## Recommended IAM policy
 
@@ -161,7 +179,7 @@ Create a dedicated IAM user (or role) used **only** for this backup, with progra
 }
 ```
 
-This grants exactly `s3:ListBucket` (needed for `aws s3 sync` to enumerate objects) and
+This grants exactly `s3:ListBucket` (needed for `s5cmd sync` to enumerate objects) and
 `s3:GetObject` (needed to download them) — no write, delete, or bucket-management permissions, and
 scoped only to the buckets actually used by this backup.
 
