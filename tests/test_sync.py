@@ -1,19 +1,53 @@
-import os
-import subprocess
+import threading
 from unittest.mock import patch, MagicMock
 import pytest
 import time
 
 from src.s3_backup.config import BucketTarget
 from src.s3_backup.summary import BucketResult
+from src.s3_backup import sync as sync_module
 from src.s3_backup.sync import sync_bucket
+
+
+class _FakePopen:
+    """Minimal stand-in for subprocess.Popen streaming stdout line by line."""
+
+    def __init__(self, lines, returncode=0):
+        self.stdout = iter(line + "\n" for line in lines)
+        self._returncode = returncode
+
+    def wait(self):
+        return self._returncode
+
+    def kill(self):
+        pass
+
+
+class _HangingFakePopen:
+    """Simulates a process whose stdout never yields until kill() is called."""
+
+    def __init__(self):
+        self._killed = threading.Event()
+        self.stdout = self._stdout_gen()
+
+    def _stdout_gen(self):
+        self._killed.wait(timeout=5)
+        return
+        yield  # pragma: no cover - makes this a generator
+
+    def kill(self):
+        self._killed.set()
+
+    def wait(self):
+        self._killed.wait(timeout=5)
+        return -9
 
 
 def test_sync_bucket_success(tmp_path):
     target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen([])
 
         result = sync_bucket(target)
 
@@ -22,14 +56,13 @@ def test_sync_bucket_success(tmp_path):
         assert result.error is None
         assert result.duration_seconds >= 0
 
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
         assert call_args[0][0] == [
-            "aws",
-            "s3",
+            "s5cmd",
             "sync",
-            "s3://test-bucket",
-            str(tmp_path),
+            "s3://test-bucket/*",
+            f"{tmp_path}/",
         ]
 
 
@@ -37,81 +70,86 @@ def test_sync_bucket_never_passes_delete_flag(tmp_path):
     """Pull-only backup: --delete must never be part of the sync command."""
     target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen([])
 
         sync_bucket(target)
 
-        cmd = mock_run.call_args[0][0]
+        cmd = mock_popen.call_args[0][0]
         assert "--delete" not in cmd
 
 
 def test_sync_bucket_creates_destination():
     target = BucketTarget(name="test-bucket", dest_path="/tmp/test-backup-new")
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
         with patch("src.s3_backup.sync.os.makedirs") as mock_makedirs:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_popen.return_value = _FakePopen([])
 
             sync_bucket(target)
 
             mock_makedirs.assert_called_once_with("/tmp/test-backup-new", exist_ok=True)
 
 
-def test_sync_bucket_failure(tmp_path):
+def test_sync_bucket_failure_on_nonzero_exit(tmp_path):
     target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.CalledProcessError(
-            returncode=1, cmd="aws", stderr="Access Denied"
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen(
+            ['ERROR "cp s3://test-bucket/x x": AccessDenied'], returncode=1
         )
 
         result = sync_bucket(target)
 
         assert result.name == "test-bucket"
         assert result.success is False
-        assert "Access Denied" in result.error or "returncode" in result.error
+        assert "AccessDenied" in result.error
+
+
+def test_sync_bucket_failure_detected_even_with_zero_exit_code(tmp_path):
+    """
+    Real s5cmd behavior: it can exit 0 even when the whole sync failed (e.g.
+    invalid credentials) — an ERROR line must be treated as a failure
+    regardless of the process's own exit code.
+    """
+    target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
+
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen(
+            ['ERROR "sync s3://test-bucket/* /backup/": InvalidAccessKeyId: ...'],
+            returncode=0,
+        )
+
+        result = sync_bucket(target)
+
+        assert result.success is False
+        assert "InvalidAccessKeyId" in result.error
 
 
 def test_sync_bucket_os_error(tmp_path):
     target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.side_effect = OSError("Permission denied")
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.side_effect = OSError("s5cmd not found")
 
         result = sync_bucket(target)
 
         assert result.name == "test-bucket"
         assert result.success is False
-        assert "Permission denied" in result.error
+        assert "s5cmd not found" in result.error
 
 
 def test_sync_bucket_measures_duration(tmp_path):
     target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
         with patch("src.s3_backup.sync.time.time") as mock_time:
             mock_time.side_effect = [100.0, 105.5]
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_popen.return_value = _FakePopen([])
 
             result = sync_bucket(target)
 
             assert result.duration_seconds == 5.5
-
-
-def test_sync_bucket_calls_subprocess_with_correct_args(tmp_path):
-    target = BucketTarget(name="my-bucket", dest_path=str(tmp_path))
-
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-
-        sync_bucket(target)
-
-        mock_run.assert_called_once()
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["check"] is True
-        assert call_kwargs["capture_output"] is True
-        assert call_kwargs["text"] is True
 
 
 def test_sync_bucket_counts_new_objects_and_bytes(tmp_path):
@@ -123,13 +161,13 @@ def test_sync_bucket_counts_new_objects_and_bytes(tmp_path):
     file_b = tmp_path / "b.txt"
     file_b.write_bytes(b"y" * 250)
 
-    stdout = (
-        f"download: s3://my-bucket/a.txt to {file_a}\n"
-        f"download: s3://my-bucket/b.txt to {file_b}\n"
-    )
+    lines = [
+        f"cp s3://my-bucket/a.txt {file_a}",
+        f"cp s3://my-bucket/b.txt {file_b}",
+    ]
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout=stdout, stderr="")
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen(lines)
 
         result = sync_bucket(target)
 
@@ -149,10 +187,10 @@ def test_sync_bucket_shrink_guard_skips_sync_when_destination_looks_wiped(tmp_pa
     target = BucketTarget(name="my-bucket", dest_path=str(tmp_path))
     backup_state.write_state(str(tmp_path), 1_000_000_000)
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
         result = sync_bucket(target)
 
-        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
         assert result.success is False
         assert "mount" in result.error.lower()
 
@@ -167,10 +205,31 @@ def test_sync_bucket_shrink_guard_allows_normal_growth(tmp_path):
 
     target = BucketTarget(name="my-bucket", dest_path=str(tmp_path))
 
-    with patch("src.s3_backup.sync.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _FakePopen([])
 
         result = sync_bucket(target)
 
-        mock_run.assert_called_once()
+        mock_popen.assert_called_once()
         assert result.success is True
+
+
+def test_sync_bucket_watchdog_kills_hung_process(tmp_path, monkeypatch):
+    """
+    s5cmd has no built-in timeout and can hang forever (e.g. a stalled
+    credential lookup). The watchdog must kill it and report a clear
+    failure instead of blocking the whole run indefinitely.
+    """
+    monkeypatch.setattr(sync_module, "SYNC_TIMEOUT_SECONDS", 0.05)
+    target = BucketTarget(name="test-bucket", dest_path=str(tmp_path))
+
+    with patch("src.s3_backup.sync.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _HangingFakePopen()
+
+        started = time.time()
+        result = sync_bucket(target)
+        elapsed = time.time() - started
+
+        assert result.success is False
+        assert "timeout" in result.error.lower() or "timed" in result.error.lower() or "hang" in result.error.lower()
+        assert elapsed < 3, "watchdog should kill the hung process well within a few seconds"
